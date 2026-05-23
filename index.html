@@ -1,0 +1,1231 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+  <meta name="theme-color" content="#0f0f11"/>
+  <meta name="description" content="نظام كاشير متكامل لمحلات الملابس"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="CLOTH POS"/>
+  <link rel="manifest" href="manifest.json"/>
+  <title>CLOTH POS — كاشير محل الملابس</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+
+  <!-- Firebase -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+    import {
+      getFirestore, collection, addDoc, getDocs, doc, updateDoc, query,
+      where, getDoc, setDoc, onSnapshot, enableIndexedDbPersistence, deleteDoc, orderBy, limit
+    } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+    /* ───────── CONFIG — غيّر هنا بياناتك ───────── */
+    const firebaseConfig = {
+      apiKey: "AIzaSyDwMOax-amBzEm3FDjXKN8yBbB3cXNbb14",
+      authDomain: "taskhub-9d282.firebaseapp.com",
+      projectId: "taskhub-9d282",
+      storageBucket: "taskhub-9d282.firebasestorage.app",
+      messagingSenderId: "981675153894",
+      appId: "1:981675153894:web:380c4194bb4ea9e1f51e27"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db  = getFirestore(app);
+    try { enableIndexedDbPersistence(db).catch(()=>{}); } catch(e){}
+
+    /* ───────── GLOBALS ───────── */
+    const COLORS  = ["أحمر","أسود","أبيض","أزرق","أخضر","أصفر","رمادي","بني","بيج","زيتي","وردي","بنفسجي","برتقالي","سكري","نيلي"];
+    const SIZES   = ["XS","S","M","L","XL","XXL","3XL","فري سايز"];
+    const SECTIONS= ["تيشرتات","بناطيل","شورتات","هوديز","جاكيتات","بلوزات","فساتين","جوارب","إكسسوارات","أخرى"];
+
+    /* ───────── UTILS ───────── */
+    const fmt   = n => `${(+n||0).toFixed(2)} ج`;
+    const today = () => new Date().toISOString().split("T")[0];
+    const nowStr= () => new Date().toLocaleString("ar-EG");
+    const genInv= () => `INV-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+
+    /* ───────── STATE ───────── */
+    let state = {
+      screen: "pos",
+      authed: false,
+      products: [],
+      invoices: [],
+      settings: { storeName:"محل الملابس", storeAddress:"", storePhone:"", password:"1234" },
+      cart: [],
+      discount: "",
+      paid: "",
+      search: "",
+      filterSection: "",
+      invSearch: "",
+      invFilter: { type:"all", dateFrom:"", dateTo:"", searchTerm:"" },
+      returnStep: "search",
+      returnInvoice: null,
+      returnSelected: [],
+      returnNewItems: [],
+      returnPin: "",
+      modal: null,         /* { type, data } */
+      toast: "",
+      reportRange: "today",
+      reportData: null,
+      loading: true,
+      saving: false,
+      invPage: 1,
+      lowStockThreshold: 3,
+    };
+
+    let toastTimer;
+    function toast(msg){ state.toast=msg; render(); clearTimeout(toastTimer); toastTimer=setTimeout(()=>{state.toast="";render();},2800); }
+    function setState(patch){ Object.assign(state, typeof patch==="function"?patch(state):patch); render(); }
+
+    /* ───────── FIREBASE LISTENERS ───────── */
+    function startListeners(){
+      onSnapshot(collection(db,"products"), snap=>{
+        state.products = snap.docs.map(d=>({id:d.id,...d.data()}));
+        render();
+      });
+      getDoc(doc(db,"settings","main")).then(s=>{
+        if(s.exists()) Object.assign(state.settings, s.data());
+        state.loading = false;
+        render();
+      }).catch(()=>{ state.loading=false; render(); });
+    }
+
+    /* ───────── LOGIN ───────── */
+    function renderLogin(){
+      const pin = state.pin||"";
+      const err = state.pinErr||false;
+      return `
+      <div class="login-wrap">
+        <div style="text-align:center">
+          <div style="font-size:52px;margin-bottom:8px">👕</div>
+          <div class="logo-text">CLOTH · POS</div>
+          <div style="font-size:13px;color:var(--muted);margin-top:4px">${state.settings.storeName}</div>
+        </div>
+        <div class="pin-display">${"●".repeat(pin.length)}</div>
+        ${err?`<div class="alert alert-red">❌ باسورد غلط، حاول تاني</div>`:""}
+        <div class="pin-grid">
+          ${["1","2","3","4","5","6","7","8","9","","0","del"].map((k,i)=>
+            k===""?`<div></div>`:
+            `<button class="pin-btn" onclick="handlePin('${k}')">${k==="del"?"⌫":k}</button>`
+          ).join("")}
+        </div>
+        <div style="color:var(--muted);font-size:12px;text-align:center">أدخل PIN للدخول</div>
+      </div>`;
+    }
+
+    window.handlePin = async (k) => {
+      if(k==="del"){ state.pin=(state.pin||"").slice(0,-1); state.pinErr=false; render(); return; }
+      const next = (state.pin||"")+k;
+      state.pin = next;
+      if(next.length>=4){
+        const stored = state.settings.password||"1234";
+        if(next===stored){ state.authed=true; state.pin=""; state.pinErr=false; startListeners(); }
+        else { state.pinErr=true; state.pin=""; }
+      }
+      render();
+    };
+
+    /* ───────── HEADER & NAV ───────── */
+    const TABS=[
+      {id:"pos",icon:"🛒",label:"الكاشير"},
+      {id:"invoices",icon:"📋",label:"الفواتير"},
+      {id:"returns",icon:"↩️",label:"مرتجعات"},
+      {id:"inventory",icon:"📦",label:"المخزن"},
+      {id:"reports",icon:"📊",label:"تقارير"},
+      {id:"settings",icon:"⚙️",label:"إعدادات"},
+    ];
+
+    function renderHeader(){
+      return `
+      <div class="header">
+        <div class="logo-text" style="letter-spacing:2px">CLOTH·POS</div>
+        <div style="font-size:14px;font-weight:600">${state.settings.storeName}</div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted)">${new Date().toLocaleDateString("ar-EG")}</div>
+      </div>
+      <div class="nav" id="nav">
+        ${TABS.map(t=>`<button class="nav-btn ${state.screen===t.id?"active":""}" onclick="setScreen('${t.id}')">
+          <span class="nav-icon">${t.icon}</span>${t.label}
+        </button>`).join("")}
+      </div>`;
+    }
+
+    window.setScreen = (s) => { state.screen=s; render(); };
+
+    /* ═══════════════════════════════════════════
+       POS SCREEN
+    ═══════════════════════════════════════════ */
+    function renderPOS(){
+      const {products, cart, search, discount, paid} = state;
+      const filtered = search.length>=1
+        ? products.filter(p=>p.name?.includes(search)||p.barcode?.includes(search)||p.section?.includes(search))
+        : products.slice(0,24);
+      const subtotal = cart.reduce((s,i)=>s+i.total,0);
+      const disc = parseFloat(discount)||0;
+      const total= Math.max(0,subtotal-disc);
+      const paidN= parseFloat(paid)||0;
+      const change= paidN-total;
+
+      return `
+      <div class="screen">
+        <div class="pos-layout">
+          <!-- PRODUCTS -->
+          <div>
+            <div class="card">
+              <input class="inp barcode-inp" id="posSearch" placeholder="🔍 بحث باسم أو باركود أو قسم..." value="${escHtml(search)}" oninput="posSearch(this.value)" autocomplete="off"/>
+              <div class="product-grid" style="margin-top:12px">
+                ${filtered.length===0?`<div class="text-muted" style="grid-column:1/-1;padding:20px;text-align:center">مفيش منتجات</div>`:""}
+                ${filtered.map(p=>{
+                  const totalQ=(p.variants||[]).reduce((s,v)=>s+v.qty,0);
+                  return `<div class="product-card" onclick="openVariantModal('${p.id}')">
+                    <div class="product-name">${escHtml(p.name)}</div>
+                    <div class="product-price">${fmt(p.salePrice)}</div>
+                    <div class="product-section">${escHtml(p.section||"")} · ${totalQ} قطعة</div>
+                  </div>`;
+                }).join("")}
+              </div>
+            </div>
+          </div>
+          <!-- CART -->
+          <div>
+            <div class="card">
+              <div class="section-title">🛒 السلة (${cart.length})</div>
+              ${cart.length===0?`<div class="text-muted" style="text-align:center;padding:20px">السلة فاضية</div>`:""}
+              ${cart.map((item,i)=>`
+                <div class="cart-item">
+                  <button class="btn btn-ghost btn-icon btn-sm" onclick="removeFromCart(${i})">✕</button>
+                  <div class="cart-item-info">
+                    <div class="cart-item-name">${escHtml(item.name)}</div>
+                    <div class="cart-item-meta">${escHtml(item.color)} · ${escHtml(item.size)}</div>
+                  </div>
+                  <div class="qty-ctrl">
+                    <button class="qty-btn" onclick="updateCartQty(${i},-1)">−</button>
+                    <span class="qty-num">${item.qty}</span>
+                    <button class="qty-btn" onclick="updateCartQty(${i},1)">+</button>
+                  </div>
+                  <div class="cart-item-price">${fmt(item.total)}</div>
+                </div>`).join("")}
+              ${cart.length>0?`
+                <div class="divider"></div>
+                <div class="total-row"><span class="total-label">المجموع الفرعي</span><span class="total-val">${fmt(subtotal)}</span></div>
+                <div class="field mt-8"><label>خصم (جنيه)</label>
+                  <input class="inp" type="number" placeholder="0" value="${escHtml(discount)}" oninput="setState({discount:this.value})"/>
+                </div>
+                ${disc>0?`<div class="total-row"><span class="total-label">الخصم</span><span class="total-val text-red">-${fmt(disc)}</span></div>`:""}
+                <div class="total-row main"><span>الإجمالي</span><span>${fmt(total)}</span></div>
+                <div class="field mt-8"><label>المبلغ المستلم</label>
+                  <input class="inp" type="number" placeholder="0.00" value="${escHtml(paid)}" oninput="setState({paid:this.value})"/>
+                </div>
+                ${paidN>0?`<div class="change-display ${change<0?"neg":""}">${change>=0?`الباقي للعميل: ${fmt(change)}`:`ناقص: ${fmt(-change)}`}</div>`:""}
+                <button class="btn btn-primary btn-block mt-12" onclick="confirmSale()" ${state.saving?"disabled":""}>
+                  ${state.saving?"⏳ جاري الحفظ...":"✅ تأكيد وطباعة"}
+                </button>
+                <button class="btn btn-ghost btn-block mt-8" onclick="clearCart()" style="color:var(--red)">🗑️ مسح السلة</button>
+              `:""}
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    window.posSearch = (v) => { state.search=v; render(); };
+    window.clearCart = () => { if(confirm("هتمسح السلة؟")) { state.cart=[]; state.discount=""; state.paid=""; render(); }};
+    window.removeFromCart = (i) => { state.cart=state.cart.filter((_,j)=>j!==i); render(); };
+    window.updateCartQty = (i,d) => {
+      state.cart = state.cart.map((item,j)=>{
+        if(j!==i) return item;
+        const nq=item.qty+d;
+        if(nq<=0) return null;
+        if(nq>item.maxQty){ toast("⚠️ الحد الأقصى "+item.maxQty+" قطعة"); return item; }
+        return {...item,qty:nq,total:item.price*nq};
+      }).filter(Boolean);
+      render();
+    };
+    window.openVariantModal = (id) => {
+      const p = state.products.find(p=>p.id===id);
+      if(!p) return;
+      state.modal = { type:"variant", data:{product:p, color:"", size:""} };
+      render();
+    };
+    window.selectColor = (c) => { state.modal.data.color=c; state.modal.data.size=""; render(); };
+    window.selectSize  = (s) => { state.modal.data.size=s; render(); };
+    window.addToCartFromModal = () => {
+      const {product,color,size} = state.modal.data;
+      const v = (product.variants||[]).find(vv=>vv.color===color&&vv.size===size);
+      if(!v||v.qty<=0){ toast("❌ المقاس ده خلص"); return; }
+      const idx = state.cart.findIndex(i=>i.productId===product.id&&i.color===color&&i.size===size);
+      if(idx>=0){
+        if(state.cart[idx].qty>=v.qty){ toast("⚠️ الكمية المتاحة "+v.qty+" فقط"); return; }
+        state.cart = state.cart.map((i,j)=>j===idx?{...i,qty:i.qty+1,total:i.price*(i.qty+1)}:i);
+      } else {
+        state.cart = [...state.cart, {productId:product.id,name:product.name,color,size,price:product.salePrice,qty:1,total:product.salePrice,maxQty:v.qty}];
+      }
+      state.modal=null;
+      toast("✅ تمت الإضافة");
+    };
+    window.confirmSale = async () => {
+      if(!state.cart.length){ toast("⚠️ السلة فاضية"); return; }
+      state.saving=true; render();
+      try{
+        const subtotal=state.cart.reduce((s,i)=>s+i.total,0);
+        const disc=parseFloat(state.discount)||0;
+        const total=Math.max(0,subtotal-disc);
+        const paidN=parseFloat(state.paid)||0;
+        const change=paidN-total;
+        const invNum=genInv();
+        const invoice={ invNum, type:"sale", date:new Date().toISOString(),
+          items:state.cart.map(i=>({...i})), subtotal, discount:disc, total, paid:paidN, change, createdAt:Date.now() };
+        await addDoc(collection(db,"invoices"),invoice);
+        for(const item of state.cart){
+          const prod=state.products.find(p=>p.id===item.productId);
+          if(!prod) continue;
+          const nv=(prod.variants||[]).map(v=>v.color===item.color&&v.size===item.size?{...v,qty:Math.max(0,v.qty-item.qty)}:v);
+          await updateDoc(doc(db,"products",item.productId),{variants:nv});
+        }
+        const saved={...invoice};
+        state.cart=[]; state.discount=""; state.paid=""; state.saving=false;
+        state.modal={type:"receipt", data:saved};
+        render();
+      }catch(e){ toast("❌ "+e.message); state.saving=false; render(); }
+    };
+
+    /* ═══════════════════════════════════════════
+       INVOICES SCREEN
+    ═══════════════════════════════════════════ */
+    async function loadInvoices(){
+      const snap = await getDocs(collection(db,"invoices"));
+      state.invoices = snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>b.createdAt-a.createdAt);
+      render();
+    }
+
+    function renderInvoices(){
+      const f = state.invFilter;
+      let list = state.invoices;
+      if(f.type!=="all") list=list.filter(i=>i.type===f.type);
+      if(f.dateFrom) list=list.filter(i=>i.date>=f.dateFrom);
+      if(f.dateTo)   list=list.filter(i=>i.date<=f.dateTo+"T23:59:59");
+      if(f.searchTerm) list=list.filter(i=>i.invNum?.includes(f.searchTerm));
+      const PAGE=15, page=state.invPage||1;
+      const total=list.length, pages=Math.ceil(total/PAGE);
+      const paged=list.slice((page-1)*PAGE,page*PAGE);
+
+      return `
+      <div class="screen">
+        <div class="card mb-12">
+          <div class="grid-2" style="margin-bottom:10px">
+            <input class="inp" placeholder="بحث برقم الفاتورة..." value="${escHtml(f.searchTerm)}" oninput="invFilter('searchTerm',this.value)"/>
+            <select class="inp" onchange="invFilter('type',this.value)">
+              <option value="all" ${f.type==="all"?"selected":""}>كل الأنواع</option>
+              <option value="sale" ${f.type==="sale"?"selected":""}>مبيعات</option>
+              <option value="return" ${f.type==="return"?"selected":""}>مرتجعات</option>
+            </select>
+          </div>
+          <div class="grid-2">
+            <div><label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">من تاريخ</label>
+              <input class="inp" type="date" value="${f.dateFrom}" onchange="invFilter('dateFrom',this.value)"/></div>
+            <div><label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">إلى تاريخ</label>
+              <input class="inp" type="date" value="${f.dateTo}" onchange="invFilter('dateTo',this.value)"/></div>
+          </div>
+          <div class="flex-between mt-12">
+            <span class="text-muted">${total} فاتورة</span>
+            <button class="btn btn-ghost btn-sm" onclick="loadInvoices()">🔄 تحديث</button>
+          </div>
+        </div>
+        ${paged.map(inv=>`
+          <div class="card mb-8" style="cursor:pointer" onclick="showInvoiceDetail('${inv.id}')">
+            <div class="flex-between">
+              <div>
+                <div class="fw-700">${escHtml(inv.invNum)}</div>
+                <div class="text-muted">${inv.date?new Date(inv.date).toLocaleString("ar-EG"):""}</div>
+              </div>
+              <div style="text-align:left">
+                <span class="badge ${inv.type==="sale"?"badge-green":"badge-red"}">${inv.type==="sale"?"بيع":"مرتجع"}</span>
+                <div class="font-mono text-accent fw-700 mt-8">${fmt(inv.total||inv.returnTotal||0)}</div>
+              </div>
+            </div>
+          </div>`).join("")}
+        ${pages>1?`
+          <div class="flex-between mt-12" style="gap:8px">
+            <button class="btn btn-ghost btn-sm" ${page<=1?"disabled":""} onclick="invSetPage(${page-1})">⬅ السابق</button>
+            <span class="text-muted">${page} / ${pages}</span>
+            <button class="btn btn-ghost btn-sm" ${page>=pages?"disabled":""} onclick="invSetPage(${page+1})">التالي ➡</button>
+          </div>`:""}
+      </div>`;
+    }
+
+    window.invFilter  = (k,v) => { state.invFilter[k]=v; state.invPage=1; render(); };
+    window.invSetPage = (p) => { state.invPage=p; render(); };
+    window.showInvoiceDetail = (id) => {
+      const inv = state.invoices.find(i=>i.id===id);
+      if(!inv) return;
+      state.modal={type:"invoiceDetail", data:inv};
+      render();
+    };
+    window.loadInvoices = loadInvoices;
+
+    /* ═══════════════════════════════════════════
+       RETURNS SCREEN
+    ═══════════════════════════════════════════ */
+    function renderReturns(){
+      const {returnStep, returnInvoice, returnSelected, returnNewItems, returnPin} = state;
+      const retItems = returnInvoice?returnInvoice.items.filter((_,i)=>returnSelected.includes(i)):[];
+      const retTotal = retItems.reduce((s,i)=>s+i.total,0);
+      const newTotal = returnNewItems.reduce((s,i)=>s+i.total,0);
+      const diff = retTotal-newTotal;
+
+      return `<div class="screen">
+        ${returnStep==="search"?`
+          <div class="card">
+            <div class="section-title">↩️ البحث عن فاتورة للمرتجع</div>
+            <div class="field"><label>رقم الفاتورة</label>
+              <input class="inp" placeholder="INV-2025-XXXXXX" id="retInvInput" value="${escHtml(state.invSearch||"")}" oninput="state.invSearch=this.value" onkeydown="if(event.key==='Enter')searchReturnInv()"/>
+            </div>
+            <button class="btn btn-primary btn-block" onclick="searchReturnInv()">بحث</button>
+          </div>
+        `:""}
+        ${returnStep==="review"&&returnInvoice?`
+          <div>
+            <div class="card mb-12">
+              <div class="flex-between mb-8">
+                <div><div class="fw-700">${returnInvoice.invNum}</div>
+                  <div class="text-muted">${new Date(returnInvoice.date).toLocaleString("ar-EG")}</div></div>
+                <button class="btn btn-ghost btn-sm" onclick="setState({returnStep:'search',returnInvoice:null,returnSelected:[],returnNewItems:[]})">⬅ رجوع</button>
+              </div>
+              <div class="section-title">اختار القطع المرتجعة</div>
+              ${returnInvoice.items.map((item,i)=>`
+                <div class="cart-item" style="cursor:pointer;opacity:${returnSelected.includes(i)?1:0.6}" onclick="toggleReturnItem(${i})">
+                  <div style="width:22px;height:22px;border-radius:4px;border:2px solid var(--border);background:${returnSelected.includes(i)?"var(--accent)":"transparent"};flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#000;font-size:12px;font-weight:700">
+                    ${returnSelected.includes(i)?"✓":""}
+                  </div>
+                  <div class="cart-item-info">
+                    <div class="cart-item-name">${escHtml(item.name)}</div>
+                    <div class="cart-item-meta">${escHtml(item.color)} · ${escHtml(item.size)} · ×${item.qty}</div>
+                  </div>
+                  <div class="cart-item-price">${fmt(item.total)}</div>
+                </div>`).join("")}
+              ${retItems.length>0?`
+                <div class="divider"></div>
+                <div class="total-row"><span class="total-label">إجمالي المرتجع</span><span class="total-val text-red">${fmt(retTotal)}</span></div>
+              `:""}
+            </div>
+            ${retItems.length>0?`
+              <div class="card mb-12">
+                <div class="section-title">💱 تبديل بمنتج آخر (اختياري)</div>
+                ${returnNewItems.map((item,i)=>`
+                  <div class="cart-item">
+                    <button class="btn btn-ghost btn-icon btn-sm" onclick="removeReturnNew(${i})">✕</button>
+                    <div class="cart-item-info"><div class="cart-item-name">${escHtml(item.name)}</div>
+                      <div class="cart-item-meta">${escHtml(item.color)} · ${escHtml(item.size)}</div></div>
+                    <div class="cart-item-price">${fmt(item.total)}</div>
+                  </div>`).join("")}
+                <button class="btn btn-ghost btn-sm btn-block mt-8" onclick="openReturnNewModal()">+ إضافة منتج للتبديل</button>
+                ${newTotal>0?`<div class="total-row mt-8"><span class="total-label">إجمالي التبديل</span><span class="total-val text-accent">${fmt(newTotal)}</span></div>`:""}
+                ${diff>=0?`<div class="alert alert-green mt-8">💰 المبلغ المسترجع: ${fmt(diff)}</div>`:`<div class="alert alert-yellow mt-8">💳 المبلغ المطلوب: ${fmt(-diff)}</div>`}
+              </div>
+              <div class="card mb-12">
+                <div class="section-title">🔒 تأكيد بالباسورد</div>
+                <input class="inp" type="password" placeholder="أدخل الباسورد" value="${returnPin}" oninput="state.returnPin=this.value;render()"/>
+                <button class="btn btn-danger btn-block mt-12" onclick="confirmReturn()" ${state.saving?"disabled":""}>
+                  ${state.saving?"⏳ جاري...":"✅ تأكيد المرتجع"}
+                </button>
+              </div>
+            `:""}
+          </div>
+        `:""}
+      </div>`;
+    }
+
+    window.toggleReturnItem = (i) => {
+      const s=state.returnSelected;
+      state.returnSelected = s.includes(i)?s.filter(j=>j!==i):[...s,i];
+      render();
+    };
+    window.removeReturnNew = (i) => { state.returnNewItems=state.returnNewItems.filter((_,j)=>j!==i); render(); };
+    window.openReturnNewModal = () => { state.modal={type:"returnNew",data:{color:"",size:"",sel:null}}; render(); };
+    window.searchReturnInv = async () => {
+      const val=(state.invSearch||"").trim().toUpperCase();
+      if(!val) return;
+      const q=query(collection(db,"invoices"),where("invNum","==",val));
+      const snap=await getDocs(q);
+      if(snap.empty){ toast("❌ الفاتورة مش موجودة"); return; }
+      const inv={id:snap.docs[0].id,...snap.docs[0].data()};
+      if(inv.type!=="sale"){ toast("❌ دي مش فاتورة بيع"); return; }
+      state.returnInvoice=inv; state.returnSelected=[]; state.returnNewItems=[]; state.returnStep="review";
+      render();
+    };
+    window.confirmReturn = async () => {
+      const {returnInvoice,returnSelected,returnNewItems,returnPin} = state;
+      const stored=state.settings.password||"1234";
+      if(returnPin!==stored){ toast("❌ باسورد غلط"); return; }
+      const retItems=returnInvoice.items.filter((_,i)=>returnSelected.includes(i));
+      if(!retItems.length){ toast("⚠️ اختار قطع المرتجع"); return; }
+      state.saving=true; render();
+      try{
+        for(const item of retItems){
+          const prod=state.products.find(p=>p.id===item.productId);
+          if(!prod) continue;
+          const nv=(prod.variants||[]).map(v=>v.color===item.color&&v.size===item.size?{...v,qty:v.qty+item.qty}:v);
+          await updateDoc(doc(db,"products",item.productId),{variants:nv});
+        }
+        for(const item of returnNewItems){
+          const prod=state.products.find(p=>p.id===item.productId);
+          if(!prod) continue;
+          const nv=(prod.variants||[]).map(v=>v.color===item.color&&v.size===item.size?{...v,qty:Math.max(0,v.qty-item.qty)}:v);
+          await updateDoc(doc(db,"products",item.productId),{variants:nv});
+        }
+        const retTotal=retItems.reduce((s,i)=>s+i.total,0);
+        const newTotal=returnNewItems.reduce((s,i)=>s+i.total,0);
+        await addDoc(collection(db,"invoices"),{
+          invNum:genInv(), type:"return", date:new Date().toISOString(),
+          refInv:returnInvoice.invNum, returnedItems:retItems, newItems:returnNewItems,
+          returnTotal:retTotal, newTotal, diff:retTotal-newTotal, createdAt:Date.now()
+        });
+        toast("✅ تم تسجيل المرتجع");
+        state.returnStep="search"; state.returnInvoice=null; state.returnSelected=[]; state.returnNewItems=[]; state.returnPin=""; state.invSearch=""; state.saving=false;
+        render();
+      }catch(e){ toast("❌ "+e.message); state.saving=false; render(); }
+    };
+
+    /* ═══════════════════════════════════════════
+       INVENTORY SCREEN
+    ═══════════════════════════════════════════ */
+    function renderInventory(){
+      const {products, filterSection} = state;
+      const search = state.invSearchProd||"";
+      const filtered = products.filter(p=>{
+        if(search && !p.name?.includes(search) && !p.barcode?.includes(search)) return false;
+        if(filterSection && p.section!==filterSection) return false;
+        return true;
+      });
+      const lowStock = products.flatMap(p=>(p.variants||[]).filter(v=>v.qty>0&&v.qty<=state.lowStockThreshold).map(v=>({...v,name:p.name})));
+      const totalProducts=products.length;
+      const totalPcs=products.reduce((s,p)=>(p.variants||[]).reduce((a,v)=>a+v.qty,s),0);
+      const totalValue=products.reduce((s,p)=>(p.variants||[]).reduce((a,v)=>a+v.qty*(p.costPrice||0),s),0);
+
+      return `<div class="screen">
+        ${lowStock.length>0?`
+          <div class="alert alert-red mb-12" style="cursor:pointer">
+            ⚠️ <strong>${lowStock.length} صنف</strong> مخزونه أقل من ${state.lowStockThreshold} قطع:
+            ${lowStock.slice(0,4).map(v=>`${escHtml(v.name)} (${v.color}/${v.size})`).join(" · ")}
+            ${lowStock.length>4?`و ${lowStock.length-4} أصناف أخرى`:""}
+          </div>`:""}
+        <div class="grid-3 mb-12">
+          <div class="stat-card"><div class="stat-val">${totalProducts}</div><div class="stat-label">موديل</div></div>
+          <div class="stat-card"><div class="stat-val">${totalPcs}</div><div class="stat-label">قطعة إجمالي</div></div>
+          <div class="stat-card"><div class="stat-val" style="font-size:16px">${fmt(totalValue)}</div><div class="stat-label">قيمة المخزن</div></div>
+        </div>
+        <div class="card mb-12">
+          <div class="grid-2" style="margin-bottom:10px">
+            <input class="inp" placeholder="بحث..." value="${escHtml(search)}" oninput="state.invSearchProd=this.value;render()"/>
+            <select class="inp" onchange="setState({filterSection:this.value})">
+              <option value="">كل الأقسام</option>
+              ${SECTIONS.map(s=>`<option value="${s}" ${filterSection===s?"selected":""}>${s}</option>`).join("")}
+            </select>
+          </div>
+          <div class="flex-between">
+            <span class="text-muted">${filtered.length} منتج</span>
+            <button class="btn btn-primary btn-sm" onclick="openProductModal(null)">+ إضافة منتج</button>
+          </div>
+        </div>
+        ${filtered.map(p=>{
+          const totalQ=(p.variants||[]).reduce((s,v)=>s+v.qty,0);
+          const hasLow=(p.variants||[]).some(v=>v.qty>0&&v.qty<=state.lowStockThreshold);
+          const profit=p.salePrice&&p.costPrice?(p.salePrice-p.costPrice).toFixed(2):null;
+          return `<div class="card mb-8 ${hasLow?"low-stock":""}">
+            <div class="flex-between mb-8">
+              <div>
+                <div class="fw-700">${escHtml(p.name)}</div>
+                <div class="text-muted">${escHtml(p.section||"")}${p.barcode?` · ${escHtml(p.barcode)}`:""}</div>
+              </div>
+              <div style="text-align:left">
+                <div class="font-mono text-accent fw-700">${fmt(p.salePrice)}</div>
+                <div class="text-muted" style="font-size:10px">تكلفة ${fmt(p.costPrice)}${profit?` · ربح ${profit}`:""}</div>
+              </div>
+            </div>
+            <div class="chips mb-8">
+              ${(p.variants||[]).map(v=>`<span class="variant-tag ${v.qty===0?"zero":v.qty<=state.lowStockThreshold?"low":""}">${v.color}/${v.size}: ${v.qty}</span>`).join("")}
+            </div>
+            <div class="flex-between">
+              <span class="text-muted">إجمالي: ${totalQ} قطعة</span>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-ghost btn-sm" onclick="deleteProduct('${p.id}','${escHtml(p.name)}')">🗑️</button>
+                <button class="btn btn-ghost btn-sm" onclick="openProductModal('${p.id}')">✏️ تعديل</button>
+              </div>
+            </div>
+          </div>`;
+        }).join("")}
+      </div>`;
+    }
+
+    window.openProductModal = (id) => {
+      const p = id?state.products.find(pp=>pp.id===id):null;
+      state.modal={type:"product", data:{
+        product:p, name:p?.name||"", section:p?.section||SECTIONS[0], barcode:p?.barcode||"",
+        salePrice:p?.salePrice||"", costPrice:p?.costPrice||"", variants:p?.variants?JSON.parse(JSON.stringify(p.variants)):[],
+        newColor:"", newSize:"", newQty:""
+      }};
+      render();
+    };
+    window.deleteProduct = async (id,name) => {
+      if(!confirm(`هتمسح "${name}"؟`)) return;
+      try{ await deleteDoc(doc(db,"products",id)); toast("✅ تم المسح"); }
+      catch(e){ toast("❌ "+e.message); }
+    };
+
+    /* ═══════════════════════════════════════════
+       REPORTS SCREEN
+    ═══════════════════════════════════════════ */
+    async function loadReport(){
+      state.reportLoading=true; render();
+      try{
+        const snap=await getDocs(collection(db,"invoices"));
+        const all=snap.docs.map(d=>d.data());
+        const now=new Date();
+        const todayStr=today();
+        const weekAgo=new Date(now-7*864e5).toISOString().split("T")[0];
+        const monthStr=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`;
+
+        function calcRange(list){
+          const sales=list.filter(i=>i.type==="sale");
+          const rets=list.filter(i=>i.type==="return");
+          return {
+            salesCount:sales.length, salesTotal:sales.reduce((s,i)=>s+(i.total||0),0),
+            retsCount:rets.length, retsTotal:rets.reduce((s,i)=>s+(i.returnTotal||0),0),
+            net:sales.reduce((s,i)=>s+(i.total||0),0)-rets.reduce((s,i)=>s+(i.returnTotal||0),0),
+            items:sales.reduce((s,i)=>s+(i.items||[]).reduce((a,it)=>a+it.qty,0),0),
+          };
+        }
+
+        const todayInvs=all.filter(i=>i.date?.startsWith(todayStr));
+        const weekInvs=all.filter(i=>i.date>=weekAgo);
+        const monthInvs=all.filter(i=>i.date?.startsWith(monthStr));
+
+        // Daily breakdown for chart (last 7 days)
+        const dailyMap={};
+        for(let d=0;d<7;d++){
+          const dt=new Date(now-d*864e5).toISOString().split("T")[0];
+          dailyMap[dt]=0;
+        }
+        all.filter(i=>i.type==="sale"&&i.date>=weekAgo).forEach(i=>{
+          const dt=i.date?.split("T")[0];
+          if(dt in dailyMap) dailyMap[dt]+=(i.total||0);
+        });
+        const dailyLabels=Object.keys(dailyMap).sort();
+        const dailyVals=dailyLabels.map(k=>dailyMap[k]);
+
+        // Top products
+        const prodMap={};
+        all.filter(i=>i.type==="sale").forEach(inv=>(inv.items||[]).forEach(it=>{
+          if(!prodMap[it.name]) prodMap[it.name]=0;
+          prodMap[it.name]+=it.qty;
+        }));
+        const topProds=Object.entries(prodMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+        state.reportData={ today:calcRange(todayInvs), week:calcRange(weekInvs), month:calcRange(monthInvs), dailyLabels, dailyVals, topProds };
+      }catch(e){ toast("❌ "+e.message); }
+      state.reportLoading=false; render();
+    }
+    window.loadReport = loadReport;
+
+    function renderReports(){
+      const {reportRange, reportData, reportLoading} = state;
+      const r = reportData?reportData[reportRange]:null;
+      const tabs=[{id:"today",label:"اليوم"},{id:"week",label:"الأسبوع"},{id:"month",label:"الشهر"}];
+
+      return `<div class="screen">
+        <div class="flex" style="gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          ${tabs.map(t=>`<button class="btn ${reportRange===t.id?"btn-primary":"btn-ghost"}" onclick="setState({reportRange:'${t.id}'});loadReport()">${t.label}</button>`).join("")}
+          <button class="btn btn-ghost" onclick="loadReport()" style="margin-right:auto">${reportLoading?"⏳ تحميل...":"🔄 تحديث"}</button>
+        </div>
+        ${!reportData?`<div class="card" style="text-align:center;padding:40px"><button class="btn btn-primary" onclick="loadReport()">📊 تحميل التقارير</button></div>`:`
+          <div class="grid-2 mb-12">
+            <div class="stat-card"><div class="stat-val text-green">${r.salesCount}</div><div class="stat-label">فاتورة بيع</div></div>
+            <div class="stat-card"><div class="stat-val text-green">${fmt(r.salesTotal)}</div><div class="stat-label">إجمالي مبيعات</div></div>
+            <div class="stat-card"><div class="stat-val text-red">${r.retsCount}</div><div class="stat-label">مرتجع</div></div>
+            <div class="stat-card"><div class="stat-val text-red">${fmt(r.retsTotal)}</div><div class="stat-label">إجمالي مرتجعات</div></div>
+            <div class="stat-card" style="grid-column:1/-1">
+              <div class="stat-val" style="font-size:28px">${fmt(r.net)}</div>
+              <div class="stat-label">صافي الإيراد · ${r.items} قطعة مباعة</div>
+            </div>
+          </div>
+          <!-- Bar Chart -->
+          <div class="card mb-12">
+            <div class="section-title">📈 مبيعات آخر 7 أيام</div>
+            ${renderBarChart(reportData.dailyLabels, reportData.dailyVals)}
+          </div>
+          <!-- Top Products -->
+          <div class="card">
+            <div class="section-title">🏆 أكثر المنتجات مبيعاً</div>
+            ${reportData.topProds.map(([name,qty],i)=>`
+              <div class="flex-between" style="padding:8px 0;border-bottom:1px solid var(--border)">
+                <span>${i+1}. ${escHtml(name)}</span>
+                <span class="font-mono text-accent fw-700">${qty} قطعة</span>
+              </div>`).join("")}
+          </div>
+        `}
+      </div>`;
+    }
+
+    function renderBarChart(labels, vals){
+      if(!labels||!labels.length) return "";
+      const maxVal=Math.max(...vals,1);
+      const barW=Math.floor(100/labels.length);
+      return `<div style="display:flex;align-items:flex-end;height:120px;gap:4px;padding:0 4px">
+        ${vals.map((v,i)=>{
+          const h=Math.round((v/maxVal)*100);
+          const label=labels[i]?.slice(5)||"";
+          return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+            <div style="font-size:9px;color:var(--muted)">${v>0?Math.round(v)+"":""}</div>
+            <div style="width:100%;background:var(--accent);border-radius:4px 4px 0 0;height:${h}%;min-height:${v>0?4:0}px;transition:height 0.3s"></div>
+            <div style="font-size:9px;color:var(--muted);white-space:nowrap">${label}</div>
+          </div>`;
+        }).join("")}
+      </div>`;
+    }
+
+    /* ═══════════════════════════════════════════
+       SETTINGS SCREEN
+    ═══════════════════════════════════════════ */
+    function renderSettings(){
+      const s=state.settings;
+      return `<div class="screen">
+        <div class="card mb-12">
+          <div class="section-title">🏪 بيانات المحل</div>
+          <div class="field"><label>اسم المحل</label>
+            <input class="inp" value="${escHtml(s.storeName)}" oninput="state.settings.storeName=this.value"/></div>
+          <div class="field"><label>العنوان</label>
+            <input class="inp" value="${escHtml(s.storeAddress)}" oninput="state.settings.storeAddress=this.value"/></div>
+          <div class="field"><label>رقم التلفون</label>
+            <input class="inp" type="tel" value="${escHtml(s.storePhone)}" oninput="state.settings.storePhone=this.value"/></div>
+          <button class="btn btn-primary btn-block" onclick="saveSettings()">💾 حفظ البيانات</button>
+        </div>
+        <div class="card mb-12">
+          <div class="section-title">🔒 تغيير الباسورد</div>
+          <div class="field"><label>الباسورد القديم</label><input class="inp" type="password" id="oldPass"/></div>
+          <div class="field"><label>الباسورد الجديد (4 أرقام على الأقل)</label><input class="inp" type="password" id="newPass"/></div>
+          <button class="btn btn-danger btn-block" onclick="changePass()">🔑 تغيير الباسورد</button>
+        </div>
+        <div class="card mb-12">
+          <div class="section-title">⚙️ إعدادات المخزن</div>
+          <div class="field"><label>تنبيه المخزون المنخفض (عند أقل من)</label>
+            <input class="inp" type="number" value="${state.lowStockThreshold}" oninput="state.lowStockThreshold=parseInt(this.value)||3;render()"/>
+          </div>
+        </div>
+        <div class="card mb-12">
+          <div class="section-title">📱 تثبيت التطبيق</div>
+          <div class="text-muted mb-8" style="font-size:13px">يمكنك تثبيت هذا التطبيق على موبايلك أو الكمبيوتر لاستخدامه بدون إنترنت</div>
+          <button class="btn btn-ghost btn-block" id="installBtn" onclick="installPWA()" style="display:none">📲 تثبيت التطبيق</button>
+          <div id="installNote" class="alert alert-yellow" style="display:none;font-size:12px">لتثبيته على iOS: اضغط Share ثم "Add to Home Screen"</div>
+        </div>
+        <div class="card" style="text-align:center">
+          <div class="text-muted" style="font-size:12px">CLOTH POS v2.0 · جميع البيانات محفوظة على Firebase</div>
+          <div class="text-muted" style="font-size:11px;margin-top:4px">يعمل offline مع مزامنة تلقائية</div>
+        </div>
+      </div>`;
+    }
+
+    window.saveSettings = async () => {
+      try{
+        await setDoc(doc(db,"settings","main"), state.settings, {merge:true});
+        toast("✅ تم الحفظ");
+      }catch(e){ toast("❌ "+e.message); }
+    };
+    window.changePass = async () => {
+      const op=document.getElementById("oldPass")?.value;
+      const np=document.getElementById("newPass")?.value;
+      if(!np||np.length<4){ toast("الباسورد الجديد 4 أرقام على الأقل"); return; }
+      if(op!==state.settings.password){ toast("❌ الباسورد القديم غلط"); return; }
+      state.settings.password=np;
+      await setDoc(doc(db,"settings","main"),{password:np},{merge:true});
+      toast("✅ تم تغيير الباسورد");
+    };
+
+    /* ═══════════════════════════════════════════
+       MODALS
+    ═══════════════════════════════════════════ */
+    function renderModal(){
+      if(!state.modal) return "";
+      const {type,data} = state.modal;
+
+      if(type==="variant") return renderVariantModal(data);
+      if(type==="receipt") return renderReceiptModal(data);
+      if(type==="product") return renderProductModal(data);
+      if(type==="returnNew") return renderReturnNewModal(data);
+      if(type==="invoiceDetail") return renderInvoiceDetailModal(data);
+      return "";
+    }
+
+    function renderVariantModal(d){
+      const {product, color, size} = d;
+      const colors=[...new Set((product.variants||[]).map(v=>v.color))];
+      const sizes=color?[...new Set((product.variants||[]).filter(v=>v.color===color).map(v=>v.size))]:[];
+      const variant=(product.variants||[]).find(v=>v.color===color&&v.size===size);
+      return `<div class="overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <div class="modal-title"><span>${escHtml(product.name)}</span>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button></div>
+          <div class="text-accent fw-700 font-mono mb-12" style="font-size:20px">${fmt(product.salePrice)}</div>
+          <div class="field"><label>اختار اللون</label>
+            <div class="chips">
+              ${colors.map(c=>{
+                const tot=(product.variants||[]).filter(v=>v.color===c).reduce((s,v)=>s+v.qty,0);
+                return `<span class="variant-tag ${color===c?"selected":""} ${tot===0?"zero":""}" onclick="${tot>0?`selectColor('${escHtml(c)}')`:""}">
+                  ${escHtml(c)} (${tot})</span>`;
+              }).join("")}
+            </div>
+          </div>
+          ${color?`<div class="field"><label>اختار المقاس</label>
+            <div class="chips">
+              ${sizes.map(s=>{
+                const v=(product.variants||[]).find(vv=>vv.color===color&&vv.size===s);
+                const qty=v?.qty||0;
+                return `<span class="variant-tag ${size===s?"selected":""} ${qty>0&&qty<=3?"low":""} ${qty===0?"zero":""}" onclick="${qty>0?`selectSize('${escHtml(s)}')`:""}">
+                  ${escHtml(s)} ${qty<=3&&qty>0?`(${qty})`:""}
+                </span>`;
+              }).join("")}
+            </div>
+          </div>`:""}
+          ${variant?`<div class="alert alert-green">متاح: ${variant.qty} قطعة</div>`:""}
+          <button class="btn btn-primary btn-block mt-12" ${!color||!size?"disabled":""} onclick="addToCartFromModal()">
+            + أضف للسلة
+          </button>
+        </div>
+      </div>`;
+    }
+
+    function renderReceiptModal(inv){
+      const storeName = state.settings.storeName||"محل الملابس";
+      return `<div class="overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <div class="modal-title"><span>✅ تم البيع بنجاح</span>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button></div>
+          <div class="alert alert-green">تم حفظ الفاتورة #${inv.invNum}</div>
+          <div class="card">
+            ${inv.items.map(i=>`<div class="total-row">
+              <span class="text-muted">${escHtml(i.name)} (${escHtml(i.color)}/${escHtml(i.size)}) ×${i.qty}</span>
+              <span class="font-mono">${fmt(i.total)}</span>
+            </div>`).join("")}
+            <div class="divider"></div>
+            ${inv.discount>0?`<div class="total-row"><span class="text-muted">خصم</span><span class="font-mono text-red">-${fmt(inv.discount)}</span></div>`:""}
+            <div class="total-row main"><span>الإجمالي</span><span>${fmt(inv.total)}</span></div>
+            <div class="total-row"><span class="text-muted">المدفوع</span><span class="font-mono">${fmt(inv.paid)}</span></div>
+            <div class="total-row"><span class="text-muted">الباقي للعميل</span><span class="font-mono text-green">${fmt(inv.change)}</span></div>
+          </div>
+          <div class="grid-2 mt-12">
+            <button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>
+            <button class="btn btn-primary" onclick="printReceipt(${JSON.stringify(inv).replace(/"/g,'&quot;')}, '${escHtml(storeName)}')">🖨️ طباعة</button>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    function renderProductModal(d){
+      return `<div class="overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <div class="modal-title"><span>${d.product?"تعديل":"إضافة"} منتج</span>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button></div>
+          <div class="field"><label>اسم الموديل *</label>
+            <input class="inp" id="pm_name" value="${escHtml(d.name)}" placeholder="مثال: تيشرت أوفر سايز" oninput="state.modal.data.name=this.value"/></div>
+          <div class="grid-2">
+            <div class="field"><label>سعر البيع *</label>
+              <input class="inp" type="number" id="pm_sale" value="${d.salePrice}" oninput="state.modal.data.salePrice=this.value"/></div>
+            <div class="field"><label>سعر التكلفة</label>
+              <input class="inp" type="number" id="pm_cost" value="${d.costPrice}" oninput="state.modal.data.costPrice=this.value"/></div>
+          </div>
+          <div class="grid-2">
+            <div class="field"><label>القسم</label>
+              <select class="inp" onchange="state.modal.data.section=this.value;render()">
+                ${SECTIONS.map(s=>`<option ${d.section===s?"selected":""}>${s}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>الباركود</label>
+              <input class="inp" id="pm_bc" value="${escHtml(d.barcode)}" oninput="state.modal.data.barcode=this.value"/></div>
+          </div>
+          <div class="section-title mt-8">المقاسات والألوان</div>
+          <div style="background:var(--bg);border-radius:8px;padding:10px;margin-bottom:12px">
+            <div class="grid-3" style="margin-bottom:8px">
+              <select class="inp" id="pm_nc" onchange="state.modal.data.newColor=this.value">
+                <option value="">اللون</option>
+                ${COLORS.map(c=>`<option>${c}</option>`).join("")}
+              </select>
+              <select class="inp" id="pm_ns" onchange="state.modal.data.newSize=this.value">
+                <option value="">المقاس</option>
+                ${SIZES.map(s=>`<option>${s}</option>`).join("")}
+              </select>
+              <input class="inp" type="number" id="pm_nq" placeholder="الكمية" oninput="state.modal.data.newQty=this.value"/>
+            </div>
+            <button class="btn btn-ghost btn-sm btn-block" onclick="pmAddVariant()">+ إضافة مقاس/لون</button>
+          </div>
+          <div style="max-height:180px;overflow-y:auto">
+            ${d.variants.map((v,i)=>`
+              <div class="cart-item" style="margin-bottom:6px">
+                <div class="cart-item-info"><div class="cart-item-name">${v.color} / ${v.size}</div></div>
+                <input class="inp" type="number" value="${v.qty}" style="width:70px;text-align:center" onchange="state.modal.data.variants[${i}].qty=Math.max(0,parseInt(this.value)||0)"/>
+                <button class="btn btn-ghost btn-icon btn-sm" onclick="pmRemoveVariant(${i})">✕</button>
+              </div>`).join("")}
+          </div>
+          <button class="btn btn-primary btn-block mt-12" onclick="saveProduct()" ${state.saving?"disabled":""}>
+            ${state.saving?"⏳ جاري الحفظ...":(d.product?"💾 حفظ التعديلات":"➕ إضافة المنتج")}
+          </button>
+        </div>
+      </div>`;
+    }
+
+    window.pmAddVariant = () => {
+      const d=state.modal.data;
+      if(!d.newColor||!d.newSize){ toast("اختار لون ومقاس"); return; }
+      if(d.variants.find(v=>v.color===d.newColor&&v.size===d.newSize)){ toast("المقاس ده موجود"); return; }
+      d.variants.push({color:d.newColor,size:d.newSize,qty:parseInt(d.newQty)||0});
+      d.newColor=""; d.newSize=""; d.newQty="";
+      render();
+    };
+    window.pmRemoveVariant = (i) => { state.modal.data.variants=state.modal.data.variants.filter((_,j)=>j!==i); render(); };
+    window.saveProduct = async () => {
+      const d=state.modal.data;
+      if(!d.name||!d.salePrice){ toast("اسم وسعر البيع مطلوبين"); return; }
+      state.saving=true; render();
+      try{
+        const data={name:d.name,section:d.section,barcode:d.barcode,salePrice:parseFloat(d.salePrice)||0,costPrice:parseFloat(d.costPrice)||0,variants:d.variants};
+        if(d.product){ await updateDoc(doc(db,"products",d.product.id),data); toast("✅ تم التعديل"); }
+        else { await addDoc(collection(db,"products"),data); toast("✅ تمت الإضافة"); }
+        state.modal=null; state.saving=false; render();
+      }catch(e){ toast("❌ "+e.message); state.saving=false; render(); }
+    };
+
+    function renderReturnNewModal(d){
+      const sel=d.sel;
+      const colors=sel?[...new Set((sel.variants||[]).map(v=>v.color))]:[];
+      const sizes=d.color?[...new Set((sel.variants||[]).filter(v=>v.color===d.color).map(v=>v.size))]:[];
+      return `<div class="overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <div class="modal-title"><span>اختار منتج للتبديل</span>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button></div>
+          ${!sel?`
+            <input class="inp mb-8" placeholder="بحث..." oninput="rnSearch(this.value)" id="rnSearchInp"/>
+            <div style="max-height:240px;overflow-y:auto">
+              ${state.products.map(p=>`<div class="product-card" style="margin-bottom:8px" onclick="rnSelect('${p.id}')">
+                <div class="product-name">${escHtml(p.name)}</div>
+                <div class="product-price">${fmt(p.salePrice)}</div>
+              </div>`).join("")}
+            </div>
+          `:`
+            <div class="fw-700 mb-8">${escHtml(sel.name)}</div>
+            <div class="field"><label>اللون</label>
+              <div class="chips">${colors.map(c=>`<span class="variant-tag ${d.color===c?"selected":""}" onclick="state.modal.data.color='${escHtml(c)}';state.modal.data.size='';render()">${escHtml(c)}</span>`).join("")}</div>
+            </div>
+            ${d.color?`<div class="field"><label>المقاس</label>
+              <div class="chips">${sizes.map(s=>{
+                const v=(sel.variants||[]).find(vv=>vv.color===d.color&&vv.size===s);
+                return `<span class="variant-tag ${d.size===s?"selected":""} ${(v?.qty||0)===0?"zero":""}" onclick="${(v?.qty||0)>0?`state.modal.data.size='${escHtml(s)}';render()`:""}">
+                  ${escHtml(s)}</span>`;
+              }).join("")}</div>
+            </div>`:""}
+            <div class="grid-2 mt-12">
+              <button class="btn btn-ghost" onclick="state.modal.data.sel=null;state.modal.data.color='';state.modal.data.size='';render()">رجوع</button>
+              <button class="btn btn-primary" ${!d.color||!d.size?"disabled":""} onclick="rnAdd()">إضافة</button>
+            </div>
+          `}
+        </div>
+      </div>`;
+    }
+
+    window.rnSelect = (id) => {
+      const p=state.products.find(pp=>pp.id===id);
+      if(!p) return;
+      state.modal.data.sel=p; state.modal.data.color=""; state.modal.data.size=""; render();
+    };
+    window.rnAdd = () => {
+      const {sel,color,size}=state.modal.data;
+      const v=(sel.variants||[]).find(vv=>vv.color===color&&vv.size===size);
+      if(!v||v.qty<=0){ toast("❌ المقاس ده خلص"); return; }
+      state.returnNewItems=[...state.returnNewItems,{productId:sel.id,name:sel.name,color,size,qty:1,price:sel.salePrice,total:sel.salePrice,maxQty:v.qty}];
+      state.modal=null; render();
+    };
+
+    function renderInvoiceDetailModal(inv){
+      const items = inv.items||inv.returnedItems||[];
+      return `<div class="overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <div class="modal-title">
+            <span>${inv.invNum}</span>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+          </div>
+          <div class="flex-between mb-8">
+            <span class="badge ${inv.type==="sale"?"badge-green":"badge-red"}">${inv.type==="sale"?"بيع":"مرتجع"}</span>
+            <span class="text-muted">${new Date(inv.date).toLocaleString("ar-EG")}</span>
+          </div>
+          ${items.map(i=>`<div class="total-row">
+            <span class="text-muted">${escHtml(i.name)} (${escHtml(i.color||"")}/${escHtml(i.size||"")}) ×${i.qty}</span>
+            <span class="font-mono">${fmt(i.total)}</span>
+          </div>`).join("")}
+          <div class="divider"></div>
+          ${inv.discount>0?`<div class="total-row"><span class="text-muted">خصم</span><span class="font-mono text-red">-${fmt(inv.discount)}</span></div>`:""}
+          <div class="total-row main"><span>الإجمالي</span><span>${fmt(inv.total||inv.returnTotal||0)}</span></div>
+          ${inv.paid!=null?`<div class="total-row"><span class="text-muted">المدفوع</span><span class="font-mono">${fmt(inv.paid)}</span></div>`:""}
+          <div class="grid-2 mt-12">
+            <button class="btn btn-ghost" onclick="closeModal()">إغلاق</button>
+            <button class="btn btn-primary" onclick="printReceipt(${JSON.stringify(inv).replace(/"/g,'&quot;')}, '${escHtml(state.settings.storeName)}')">🖨️ طباعة</button>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    window.closeModal  = () => { state.modal=null; render(); };
+
+    /* ═══════════════════════════════════════════
+       PRINT RECEIPT
+    ═══════════════════════════════════════════ */
+    window.printReceipt = (inv, storeName) => {
+      const items=inv.items||inv.returnedItems||[];
+      const win=window.open("","_blank","width=420,height=700");
+      win.document.write(`<!DOCTYPE html><html dir="rtl"><head><title>فاتورة ${inv.invNum}</title>
+      <style>
+        body{font-family:monospace;font-size:13px;max-width:58mm;margin:0 auto;padding:6px;direction:rtl}
+        .c{text-align:center}.b{font-weight:bold}.l{border-top:1px dashed #000;margin:6px 0}
+        .r{display:flex;justify-content:space-between}.big{font-size:16px;font-weight:bold}
+        @media print{@page{margin:4mm}}
+      </style></head><body>
+      <div class="c b" style="font-size:16px">${storeName}</div>
+      <div class="c">${state.settings.storeAddress||""}</div>
+      <div class="c">${state.settings.storePhone||""}</div>
+      <div class="l"></div>
+      <div class="c b">#${inv.invNum}</div>
+      <div class="c">${nowStr()}</div>
+      <div class="c">${inv.type==="return"?"فاتورة مرتجع":"فاتورة مبيعات"}</div>
+      <div class="l"></div>
+      ${items.map(i=>`<div class="r"><span>${i.name} (${i.color}/${i.size})</span></div>
+      <div class="r"><span>${i.qty} × ${(+i.price||0).toFixed(2)}</span><span>${(+i.total||0).toFixed(2)}</span></div>`).join("")}
+      <div class="l"></div>
+      ${inv.discount>0?`<div class="r"><span>خصم</span><span>${(+inv.discount).toFixed(2)}</span></div>`:""}
+      <div class="r big"><span>الإجمالي</span><span>${(+(inv.total||inv.returnTotal||0)).toFixed(2)} ج</span></div>
+      ${inv.paid!=null?`<div class="r"><span>المدفوع</span><span>${(+inv.paid).toFixed(2)} ج</span></div>`:""}
+      ${inv.change!=null?`<div class="r"><span>الباقي</span><span>${(+inv.change).toFixed(2)} ج</span></div>`:""}
+      <div class="l"></div>
+      <div class="c">شكراً لزيارتكم ❤️</div>
+      </body></html>`);
+      win.document.close();
+      win.focus();
+      setTimeout(()=>win.print(),300);
+    };
+
+    /* ═══════════════════════════════════════════
+       BARCODE SCANNER
+    ═══════════════════════════════════════════ */
+    let barcodeBuffer="", barcodeTimer2;
+    document.addEventListener("keydown", e=>{
+      const active=document.activeElement;
+      if(active&&active.tagName==="INPUT"&&active.id!=="posSearch") return;
+      if(e.key==="Enter"){
+        if(barcodeBuffer.length>3) handleBarcode(barcodeBuffer);
+        barcodeBuffer=""; return;
+      }
+      if(e.key.length===1){ barcodeBuffer+=e.key; clearTimeout(barcodeTimer2); barcodeTimer2=setTimeout(()=>{barcodeBuffer="";},120); }
+    });
+
+    function handleBarcode(code){
+      if(state.screen!=="pos") return;
+      const prod=state.products.find(p=>p.barcode===code||(p.variants||[]).some(v=>v.barcode===code));
+      if(!prod){ toast("❌ الباركود مش موجود"); return; }
+      const variant=(prod.variants||[]).find(v=>v.barcode===code);
+      if(variant){ addToCartDirect(prod,variant.color,variant.size); }
+      else { openVariantModal(prod.id); }
+    }
+
+    function addToCartDirect(prod,color,size){
+      const v=(prod.variants||[]).find(vv=>vv.color===color&&vv.size===size);
+      if(!v||v.qty<=0){ toast("❌ المقاس ده خلص"); return; }
+      const idx=state.cart.findIndex(i=>i.productId===prod.id&&i.color===color&&i.size===size);
+      if(idx>=0){
+        if(state.cart[idx].qty>=v.qty){ toast("⚠️ الكمية المتاحة "+v.qty); return; }
+        state.cart=state.cart.map((i,j)=>j===idx?{...i,qty:i.qty+1,total:i.price*(i.qty+1)}:i);
+      } else {
+        state.cart=[...state.cart,{productId:prod.id,name:prod.name,color,size,price:prod.salePrice,qty:1,total:prod.salePrice,maxQty:v.qty}];
+      }
+      toast("✅ "+prod.name);
+    }
+
+    /* ═══════════════════════════════════════════
+       PWA INSTALL
+    ═══════════════════════════════════════════ */
+    let deferredPrompt;
+    window.addEventListener("beforeinstallprompt", e=>{
+      e.preventDefault(); deferredPrompt=e;
+      const btn=document.getElementById("installBtn");
+      if(btn){ btn.style.display="block"; }
+    });
+    window.installPWA = async () => {
+      if(!deferredPrompt){ const n=document.getElementById("installNote"); if(n)n.style.display="block"; return; }
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      deferredPrompt=null;
+    };
+
+    /* ═══════════════════════════════════════════
+       RENDER
+    ═══════════════════════════════════════════ */
+    function escHtml(s){ return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+    function render(){
+      const root=document.getElementById("root");
+      if(!root) return;
+      if(!state.authed){ root.innerHTML=renderLogin(); return; }
+      if(state.loading){ root.innerHTML=`<div class="flex-center" style="height:100vh"><div class="spinner"></div></div>`; return; }
+
+      let content="";
+      if(state.screen==="pos")       content=renderPOS();
+      else if(state.screen==="invoices")  content=renderInvoices();
+      else if(state.screen==="returns")   content=renderReturns();
+      else if(state.screen==="inventory") content=renderInventory();
+      else if(state.screen==="reports")   content=renderReports();
+      else if(state.screen==="settings")  content=renderSettings();
+
+      root.innerHTML=`
+        <div class="app">
+          ${renderHeader()}
+          <div class="content">${content}</div>
+          ${renderModal()}
+          ${state.toast?`<div class="toast">${escHtml(state.toast)}</div>`:""}
+        </div>`;
+
+      // Show install button if available
+      if(deferredPrompt){
+        const btn=document.getElementById("installBtn");
+        if(btn) btn.style.display="block";
+      }
+    }
+
+    // Initial render
+    render();
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f11; --surface: #1a1a1f; --surface2: #222228; --border: #2e2e38;
+      --accent: #f5c842; --accent2: #ff6b35; --green: #22c55e; --red: #ef4444;
+      --blue: #3b82f6; --text: #f0f0f0; --muted: #888;
+      --font-ar: 'IBM Plex Sans Arabic', sans-serif; --font-mono: 'Space Mono', monospace;
+    }
+    html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-ar); direction: rtl; }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 16px; height: 56px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    .logo-text { font-family: var(--font-mono); font-size: 13px; color: var(--accent); letter-spacing: 2px; }
+    .content { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+    .nav { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); overflow-x: auto; flex-shrink: 0; -webkit-overflow-scrolling: touch; }
+    .nav::-webkit-scrollbar { display: none; }
+    .nav-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px 16px; cursor: pointer; border: none; background: none; color: var(--muted); font-family: var(--font-ar); font-size: 11px; white-space: nowrap; border-bottom: 2px solid transparent; transition: all 0.15s; flex-shrink: 0; }
+    .nav-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .nav-btn:hover:not(.active) { color: var(--text); }
+    .nav-icon { font-size: 20px; }
+    .screen { flex: 1; overflow-y: auto; padding: 16px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .card + .card { margin-top: 12px; }
+    .field { margin-bottom: 12px; }
+    .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
+    .inp { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: var(--font-ar); font-size: 15px; padding: 10px 12px; outline: none; transition: border-color 0.15s; }
+    .inp:focus { border-color: var(--accent); }
+    .inp::placeholder { color: var(--muted); }
+    select.inp { appearance: none; cursor: pointer; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 11px 18px; border-radius: 8px; border: none; cursor: pointer; font-family: var(--font-ar); font-size: 14px; font-weight: 600; transition: all 0.15s; white-space: nowrap; }
+    .btn:active { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-primary:hover:not(:disabled) { background: #f0bc20; }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn-ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn-ghost:hover:not(:disabled) { background: var(--border); }
+    .btn-success { background: var(--green); color: #fff; }
+    .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 6px; }
+    .btn-block { width: 100%; }
+    .btn-icon { width: 36px; height: 36px; padding: 0; border-radius: 8px; }
+    .pos-layout { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 768px) { .pos-layout { grid-template-columns: 1fr 380px; } }
+    .cart-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--bg); border-radius: 8px; margin-bottom: 8px; border: 1px solid var(--border); }
+    .cart-item-info { flex: 1; min-width: 0; }
+    .cart-item-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cart-item-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .cart-item-price { font-family: var(--font-mono); font-size: 14px; color: var(--accent); font-weight: 700; white-space: nowrap; }
+    .qty-ctrl { display: flex; align-items: center; gap: 8px; }
+    .qty-btn { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+    .total-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; }
+    .total-row.main { font-size: 20px; font-weight: 700; color: var(--accent); border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+    .total-label { color: var(--muted); font-size: 13px; }
+    .total-val { font-family: var(--font-mono); font-weight: 700; }
+    .change-display { background: var(--green); color: #fff; border-radius: 8px; padding: 10px 14px; text-align: center; font-family: var(--font-mono); font-size: 18px; font-weight: 700; margin-top: 8px; }
+    .change-display.neg { background: var(--red); }
+    .product-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+    .product-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; cursor: pointer; transition: all 0.15s; }
+    .product-card:hover { border-color: var(--accent); background: var(--surface2); }
+    .product-name { font-size: 12px; font-weight: 600; margin-bottom: 6px; line-height: 1.4; }
+    .product-price { font-family: var(--font-mono); font-size: 14px; color: var(--accent); font-weight: 700; }
+    .product-section { font-size: 10px; color: var(--muted); margin-top: 2px; }
+    .variant-tag { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 20px; border: 1px solid var(--border); font-size: 12px; cursor: pointer; margin: 3px; transition: all 0.15s; background: var(--bg); }
+    .variant-tag.selected { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 700; }
+    .variant-tag.low { border-color: var(--red); color: var(--red); }
+    .variant-tag.zero { opacity: 0.35; cursor: not-allowed; }
+    .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+    .badge-red { background: rgba(239,68,68,0.15); color: var(--red); }
+    .badge-green { background: rgba(34,197,94,0.15); color: var(--green); }
+    .badge-yellow { background: rgba(245,200,66,0.15); color: var(--accent); }
+    .inv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .inv-table th { text-align: right; padding: 8px 10px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); font-size: 11px; }
+    .inv-table td { padding: 10px; border-bottom: 1px solid var(--border); }
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100; display: flex; align-items: flex-end; justify-content: center; backdrop-filter: blur(4px); }
+    @media (min-width: 600px) { .overlay { align-items: center; } }
+    .modal { background: var(--surface); border-radius: 16px 16px 0 0; padding: 20px; width: 100%; max-width: 540px; max-height: 90vh; overflow-y: auto; animation: slideUp 0.2s ease; }
+    @media (min-width: 600px) { .modal { border-radius: 16px; } }
+    @keyframes slideUp { from { transform: translateY(30px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+    .login-wrap { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 24px; }
+    .pin-display { font-family: var(--font-mono); font-size: 32px; letter-spacing: 16px; min-height: 48px; text-align: center; color: var(--accent); }
+    .pin-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; max-width: 280px; width: 100%; }
+    .pin-btn { aspect-ratio: 1; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: var(--font-ar); font-size: 22px; font-weight: 600; cursor: pointer; transition: all 0.1s; }
+    .pin-btn:active { background: var(--accent); color: #000; transform: scale(0.94); }
+    .section-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .section-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .alert { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+    .alert-red { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: var(--red); }
+    .alert-green { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); color: var(--green); }
+    .alert-yellow { background: rgba(245,200,66,0.1); border: 1px solid rgba(245,200,66,0.3); color: var(--accent); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; text-align: center; }
+    .stat-val { font-family: var(--font-mono); font-size: 24px; font-weight: 700; color: var(--accent); }
+    .stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .flex { display: flex; } .flex-between { display: flex; justify-content: space-between; align-items: center; }
+    .flex-center { display: flex; align-items: center; justify-content: center; }
+    .gap-8 { gap: 8px; } .gap-12 { gap: 12px; }
+    .mt-8 { margin-top: 8px; } .mt-12 { margin-top: 12px; } .mt-16 { margin-top: 16px; }
+    .mb-8 { margin-bottom: 8px; } .mb-12 { margin-bottom: 12px; }
+    .text-muted { color: var(--muted); font-size: 12px; }
+    .text-accent { color: var(--accent); } .text-red { color: var(--red); } .text-green { color: var(--green); }
+    .font-mono { font-family: var(--font-mono); } .fw-700 { font-weight: 700; }
+    .divider { height: 1px; background: var(--border); margin: 12px 0; }
+    .low-stock { background: rgba(239,68,68,0.06); border-color: rgba(239,68,68,0.3) !important; }
+    .barcode-inp { border-color: var(--accent) !important; background: rgba(245,200,66,0.04) !important; }
+    .spinner { width: 28px; height: 28px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 10px 22px; border-radius: 20px; font-size: 13px; z-index: 999; animation: toastIn 0.2s ease; white-space: nowrap; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+    @keyframes toastIn { from { opacity:0; transform:translateX(-50%) translateY(10px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+    @media print { .app, .header, .nav, .no-print { display: none !important; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Service Worker للـ PWA -->
+  <script>
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.register('/sw.js').catch(()=>{});
+    }
+  </script>
+</body>
+</html>

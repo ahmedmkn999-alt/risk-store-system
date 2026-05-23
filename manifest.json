@@ -1,0 +1,22 @@
+{
+  "name": "CLOTH POS — كاشير محل الملابس",
+  "short_name": "CLOTH POS",
+  "description": "نظام كاشير متكامل لمحلات الملابس",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f0f11",
+  "theme_color": "#0f0f11",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' fill='%230f0f11'/><text x='256' y='320' font-size='280' text-anchor='middle'>👕</text></svg>",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["business", "productivity"],
+  "screenshots": []
+}
